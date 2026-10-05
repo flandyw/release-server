@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -230,5 +231,203 @@ func TestExperimentalRevisionsAndLegacyHistory(t *testing.T) {
 	stable := addRelease(t, data, apk, "2.1.8", 2180000)
 	if stable.VersionCode <= second.VersionCode {
 		t.Fatal("next stable did not supersede experimental")
+	}
+}
+
+func TestRejectUntrustedManifest(t *testing.T) {
+	data := t.TempDir()
+	r := addRelease(t, data, testAPK(t, "manifest"), "2.1.8", 218)
+	mutations := map[string]func(*release){
+		"external page":      func(r *release) { r.URL = "https://evil.example/" },
+		"external download":  func(r *release) { r.Assets[0].URL = "https://evil.example/build.apk" },
+		"external checksum":  func(r *release) { r.Assets[1].URL = "https://evil.example/SHA256SUMS" },
+		"header injection":   func(r *release) { r.Assets[0].Digest = "sha256:bad\r\nInjected: yes" },
+		"missing digest":     func(r *release) { r.Assets[0].Digest = "" },
+		"empty APK":          func(r *release) { r.Assets[0].Size = 0 },
+		"oversized APK":      func(r *release) { r.Assets[0].Size = maxAPK + 1 },
+		"oversized checksum": func(r *release) { r.Assets[1].Size = maxAPK },
+		"draft":              func(r *release) { r.Draft = true },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			bad := r
+			bad.Assets = append([]asset(nil), r.Assets...)
+			mutate(&bad)
+			if err := writeJSON(filepath.Join(data, "latest.json"), bad); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{"/releases/latest.json", "/releases/latest", "/releases/latest.apk"} {
+				w := httptest.NewRecorder()
+				handler(data).ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+				if w.Code != 503 {
+					t.Fatalf("%s: status %d", path, w.Code)
+				}
+			}
+		})
+	}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{
+		"trailing JSON":      append(append([]byte(nil), raw...), []byte("{}")...),
+		"trailing junk":      append(append([]byte(nil), raw...), []byte("broken")...),
+		"oversized manifest": append(append([]byte(nil), raw...), []byte(strings.Repeat(" ", maxManifest))...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(data, "latest.json"), body, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readRelease(filepath.Join(data, "latest.json")); err == nil {
+				t.Fatal("accepted corrupt manifest")
+			}
+		})
+	}
+}
+
+func TestConfinedReleaseReads(t *testing.T) {
+	for _, target := range []string{"latest.json", "manifest", "directory", "asset", "fifo manifest", "fifo asset"} {
+		t.Run(target, func(t *testing.T) {
+			data, outside := t.TempDir(), t.TempDir()
+			r := addRelease(t, data, testAPK(t, "confined"), "2.1.8", 218)
+			externalManifest := filepath.Join(outside, "release.json")
+			if err := writeJSON(externalManifest, r); err != nil {
+				t.Fatal(err)
+			}
+			path, replacement := filepath.Join(data, "latest.json"), externalManifest
+			request := "/releases/latest.json"
+			if target != "latest.json" {
+				path = filepath.Join(data, r.Tag, "release.json")
+				request = "/releases/" + r.Tag + "/release.json"
+			}
+			if target == "directory" {
+				path, replacement = filepath.Join(data, r.Tag), outside
+				if err := os.RemoveAll(path); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if target == "asset" || target == "fifo asset" {
+					path = filepath.Join(data, r.Tag, r.Assets[0].Name)
+					request = "/releases/" + r.Tag + "/" + r.Assets[0].Name
+					replacement = testAPK(t, "confined")
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if strings.HasPrefix(target, "fifo") {
+				if err := syscall.Mkfifo(path, 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Symlink(replacement, path); err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			handler(data).ServeHTTP(w, httptest.NewRequest("GET", request, nil))
+			if w.Code != 404 && w.Code != 503 {
+				t.Fatalf("unsafe file served: status %d", w.Code)
+			}
+			if target == "manifest" || target == "directory" {
+				w = httptest.NewRecorder()
+				handler(data).ServeHTTP(w, httptest.NewRequest("GET", "/releases/", nil))
+				if strings.Contains(w.Body.String(), r.Assets[0].Name) {
+					t.Fatal("unsafe manifest included in catalog")
+				}
+			}
+		})
+	}
+}
+
+func TestRequestLimitsAndSecurityHeaders(t *testing.T) {
+	data := t.TempDir()
+	r := addRelease(t, data, testAPK(t, "ranges"), "2.1.8", 218)
+	h := handler(data)
+	path := "/releases/" + r.Tag + "/" + r.Assets[0].Name
+	for _, ranges := range [][]string{{"bytes=0-1,2-3"}, {"bytes=0-1", "bytes=2-3"}} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header["Range"] = ranges
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 416 {
+			t.Fatalf("accepted multiple ranges: %d", w.Code)
+		}
+	}
+	for _, chunked := range []bool{false, true} {
+		req := httptest.NewRequest("GET", path, strings.NewReader("body"))
+		if chunked {
+			req.ContentLength = -1
+			req.TransferEncoding = []string{"chunked"}
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 400 || w.Header().Get("Connection") != "close" {
+			t.Fatal("accepted request body")
+		}
+	}
+	for _, path := range []string{"/healthz", "/releases/", "/missing", path} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		for key, expected := range map[string]string{"X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"} {
+			if w.Header().Get(key) != expected {
+				t.Fatalf("%s missing %s", path, key)
+			}
+		}
+		if !strings.Contains(w.Header().Get("Content-Security-Policy"), "form-action 'none'") {
+			t.Fatal("missing CSP")
+		}
+	}
+}
+
+func TestLoopbackOnly(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:8787", "[::1]:8787"} {
+		if err := validateListen(addr); err != nil {
+			t.Fatalf("%s: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{":8787", "0.0.0.0:8787", "[::]:8787", "192.0.2.1:8787", "localhost:8787", "invalid"} {
+		if err := serve(t.TempDir(), addr); err == nil {
+			t.Fatalf("accepted public/ambiguous listener %s", addr)
+		}
+	}
+}
+
+func TestPublishVerifiedChecksum(t *testing.T) {
+	data, apk := t.TempDir(), testAPK(t, "verified")
+	bytes, err := os.ReadFile(apk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(bytes)
+	if err := run([]string{"publish", "-data", data, "-apk", apk, "-version-name", "2.1.8", "-version-code", "218", "-expected-sha256", hex.EncodeToString(digest[:])}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"publish", "-data", data, "-apk", testAPK(t, "replaced"), "-version-name", "2.1.9", "-version-code", "219", "-expected-sha256", hex.EncodeToString(digest[:])}); err == nil {
+		t.Fatal("published replaced APK")
+	}
+	latest, err := readRelease(filepath.Join(data, "latest.json"))
+	if err != nil || latest.VersionCode != 218 {
+		t.Fatal("failed checksum changed latest")
+	}
+	if _, err := os.Stat(filepath.Join(data, "v2.1.9")); !os.IsNotExist(err) {
+		t.Fatal("failed publish left a release")
+	}
+}
+
+func TestPublishRejectsUnsafeLock(t *testing.T) {
+	for _, kind := range []string{"symlink", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			data := t.TempDir()
+			path := filepath.Join(data, ".publish.lock")
+			if kind == "symlink" {
+				if err := os.Symlink(filepath.Join(t.TempDir(), "lock"), path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := syscall.Mkfifo(path, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := publish(data, publicOrigin, testAPK(t, "locked"), "2.1.8", 218, "", time.Now()); err == nil {
+				t.Fatal("accepted unsafe publish lock")
+			}
+		})
 	}
 }

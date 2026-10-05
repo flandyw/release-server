@@ -12,12 +12,16 @@ stable release whose version code exceeds the installed experimental build.
 
 ## Build and test
 
-Go 1.24 or newer; Linux. The binary uses only Go's standard library.
+Go 1.27.1 or newer; Linux. The binary uses only Go's standard library. Keep the
+compiler on a supported, patched Go release: the HTTP server and filesystem
+confinement depend on standard-library security fixes. Go can automatically
+download the minimum toolchain specified in `go.mod`.
 
 ```sh
 cd release-server
 go test -race ./...
 go vet ./...
+GOTOOLCHAIN=go1.27.1 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 mkdir -p build
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/folio-release-server .
 mkdir -p /tmp/folio-releases
@@ -39,7 +43,13 @@ The installer builds/tests, installs `/usr/local/bin/folio-release-server`, crea
 the unprivileged `folio-releases` account, enables/restarts
 `folio-releases.service`, and sets up a dedicated Nginx host. Other Nginx hosts are
 left in place. Go listens only on `127.0.0.1:8787`; no new public application port
-is needed. The service filesystem is read-only. Publishing runs locally with sudo.
+is needed. The service filesystem is read-only, and systemd limits its syscalls, memory,
+threads, file descriptors, and access to the host. Publishing runs locally with
+sudo. Release storage must remain owned by root and unwritable by the service or
+other untrusted users, including existing release directories and files. The
+installer sets root ownership on the storage directory; audit existing contents
+when upgrading. The service is read-only, but publishing is a trusted local
+administration operation, not a privilege boundary for users with sudo access.
 
 Certbot uses `/var/www/folio-acme` for HTTP-01, stores the certificate in
 `/etc/letsencrypt/live/folio.flandolf.me`, and renews through `certbot.timer`.
@@ -75,7 +85,15 @@ bash ./build.sh
 
 `publish.sh` verifies the APK signature and pinned certificate, reads the package
 and versions directly with `aapt`, requires `com.folio.notes`, and publishes with
-the actual embedded versionCode/versionName. It defaults to Android SDK build tools
+the actual embedded versionCode/versionName. It hashes the staged APK before
+verification and passes `-expected-sha256` to the publisher, which checks the
+bytes it copied before exposing the release; a changed APK aborts publication.
+The certificate digest must be a nonempty, valid SHA-256 fingerprint.
+`build.sh` requires the verifier and metadata tools before allocating a version,
+verifies the package and reserved code/name after building, and publishes the
+private APK snapshot it verified. Signature or metadata failures stop the build
+flow even when publication is disabled. It passes the expected code, name and
+SHA-256 to `publish.sh`; the wrapper checks all three again before publishing. It defaults to Android SDK build tools
 36.0.0; override their directory with `FOLIO_BUILD_TOOLS`. These SDK tools are only
 needed for publishing, not for the server or Go build.
 
@@ -131,8 +149,27 @@ sudo /usr/local/bin/folio-release-server publish \
 | `/releases/vX.Y.Z-exp.N/release.json` | That build's metadata |
 | `/healthz` | Service liveness |
 
-All endpoints accept only GET/HEAD. There is no network upload API or publishing
-secret. The app requires HTTPS on official hosts, checks SHA-256 before exposing
+At the origin, all endpoints accept only GET/HEAD, without request bodies. Manifest and download
+reads are confined to release storage, reject nonregular files without blocking
+on FIFOs, and validate official asset URLs, SHA-256 digests and sizes. Corrupt
+latest manifests return 503, including the latest redirects. Single byte ranges
+remain supported; multipart ranges are rejected at the origin to bound download
+work. Cloudflare may satisfy cached GET requests (including bodies and multipart
+ranges) without forwarding them to the origin; these controls protect the VPS. Go bounds
+active requests to 128 and total response time to ten minutes. Nginx bounds stalled
+connections to 60 seconds, simultaneous requests to 128, and requests per client
+IP to 20/second with a burst of 40 (429 on excess). Review the published Cloudflare proxy ranges in
+`deploy/nginx-https.conf` when they change. The template restores visitor addresses only from those trusted peers,
+so rate limits apply to visitors rather than proxy IPs. Direct requests cannot
+spoof their address with `CF-Connecting-IP` or `X-Forwarded-For`. See
+[Cloudflare's visitor IP guidance](https://developers.cloudflare.com/support/troubleshooting/restoring-visitor-ips/restoring-original-visitor-ips/).
+
+All endpoints send a restrictive CSP, anti-framing, no-sniff, and no-referrer
+headers; Nginx adds HSTS on HTTPS. Apply the updated binary and deployment templates
+by rerunning `install.sh`; review existing Nginx configuration and systemd resource
+limits for your host first.
+
+There is no network upload API or publishing secret. The app requires HTTPS on official hosts, checks SHA-256 before exposing
 an APK to the installer, and Android verifies its signing identity.
 
 ```sh

@@ -13,6 +13,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,11 +27,17 @@ import (
 )
 
 const maxAPK = 100 * 1024 * 1024 // Matches the Android updater's limit.
+const maxManifest = 1024 * 1024
+const publicOrigin = "https://folio.flandolf.me"
+
+var expectedDigestPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 var versionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(-exp\.[1-9][0-9]{0,3})?$`)
 
 func validVersion(version string, code int64) bool {
-	if !versionPattern.MatchString(version) || code <= 0 || code > 2100000000 {
+	if len(version) > 64 || !versionPattern.MatchString(version) || code <= 0 || code > 2100000000 {
 		return false
 	}
 	base, revision, experimental := strings.Cut(version, "-exp.")
@@ -95,6 +102,7 @@ func run(args []string) error {
 	listen := flags.String("listen", "127.0.0.1:8787", "HTTP address (behind Nginx)")
 	apk := flags.String("apk", "", "signed APK to publish")
 	version := flags.String("version-name", "", "APK versionName")
+	expected := flags.String("expected-sha256", "", "SHA-256 of the verified APK")
 	code := flags.Int64("version-code", 0, "APK versionCode")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -113,7 +121,7 @@ func run(args []string) error {
 		if *apk == "" {
 			return errors.New("publish requires -apk, -version-name and -version-code")
 		}
-		_, err := publish(*data, *base, *apk, *version, *code, "", time.Now().UTC())
+		_, err := publish(*data, *base, *apk, *version, *code, *expected, time.Now().UTC())
 		return err
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -121,18 +129,65 @@ func run(args []string) error {
 }
 
 func readRelease(path string) (release, error) {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return release{}, err
+	}
+	defer root.Close()
+	return readReleaseAt(root, filepath.Base(path))
+}
+
+// Linux is the supported deployment platform. O_NONBLOCK prevents a planted FIFO
+// from hanging a request before its type can be checked on the opened descriptor.
+func openRegular(root *os.Root, path string) (*os.File, error) {
+	f, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = errors.New("not a regular file")
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func readReleaseAt(root *os.Root, path string) (release, error) {
 	var r release
-	f, err := os.Open(path)
+	f, err := openRegular(root, path)
 	if err != nil {
 		return r, err
 	}
 	defer f.Close()
-	err = json.NewDecoder(io.LimitReader(f, 1024*1024)).Decode(&r)
+	info, err := f.Stat()
 	if err != nil {
 		return r, err
 	}
-	if !validVersion(r.VersionName, r.VersionCode) || r.Tag != "v"+r.VersionName || len(r.Assets) != 2 || r.Assets[0].Name != "folio-"+r.VersionName+".apk" || r.Assets[1].Name != "SHA256SUMS" {
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxManifest {
+		return r, errors.New("invalid release manifest size/type")
+	}
+	decoder := json.NewDecoder(io.LimitReader(f, maxManifest+1))
+	if err := decoder.Decode(&r); err != nil {
+		return r, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return r, errors.New("trailing release manifest data")
+	}
+	if !validVersion(r.VersionName, r.VersionCode) || r.Tag != "v"+r.VersionName ||
+		len(r.Assets) != 2 || r.Assets[0].Name != "folio-"+r.VersionName+".apk" ||
+		r.Assets[1].Name != "SHA256SUMS" || r.URL != publicOrigin+"/releases/"+r.Tag+"/" ||
+		r.Published.IsZero() || r.Draft || r.Prerelease {
 		return r, errors.New("invalid release manifest")
+	}
+	for i, a := range r.Assets {
+		if a.URL != r.URL+a.Name || !digestPattern.MatchString(a.Digest) || a.Size <= 0 ||
+			(i == 0 && a.Size > maxAPK) || (i == 1 && a.Size != int64(64+2+len(r.Assets[0].Name)+1)) {
+			return r, errors.New("invalid release asset")
+		}
 	}
 	return r, nil
 }
@@ -190,17 +245,35 @@ func validateAPK(path string) error {
 // flock serializes publishers, directories are immutable, and latest never downgrades.
 func publish(data, base, apk, version string, code int64, expected string, published time.Time) (release, error) {
 	var r release
+	if base != publicOrigin {
+		return r, errors.New("invalid public origin")
+	}
+	if expected != "" && !expectedDigestPattern.MatchString(expected) {
+		return r, errors.New("invalid expected SHA-256")
+	}
 	if !validVersion(version, code) {
 		return r, errors.New("invalid version name/code")
 	}
 	if err := os.MkdirAll(data, 0755); err != nil {
 		return r, err
 	}
-	lock, err := os.OpenFile(filepath.Join(data, ".publish.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	root, err := os.OpenRoot(data)
+	if err != nil {
+		return r, err
+	}
+	defer root.Close()
+	lock, err := root.OpenFile(".publish.lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 	if err != nil {
 		return r, err
 	}
 	defer lock.Close()
+	lockInfo, err := lock.Stat()
+	if err != nil {
+		return r, err
+	}
+	if !lockInfo.Mode().IsRegular() {
+		return r, errors.New("invalid publish lock")
+	}
 	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return r, err
 	}
@@ -212,11 +285,18 @@ func publish(data, base, apk, version string, code int64, expected string, publi
 	defer os.RemoveAll(stage)
 	name := "folio-" + version + ".apk"
 	dest := filepath.Join(stage, name)
-	in, err := os.Open(apk)
+	in, err := os.OpenFile(apk, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return r, err
 	}
 	defer in.Close()
+	inputInfo, err := in.Stat()
+	if err != nil {
+		return r, err
+	}
+	if !inputInfo.Mode().IsRegular() || inputInfo.Size() <= 0 || inputInfo.Size() > maxAPK {
+		return r, errors.New("APK must be a regular file between 1 byte and 100 MiB")
+	}
 	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return r, err
@@ -266,7 +346,7 @@ func publish(data, base, apk, version string, code int64, expected string, publi
 	if err = writeJSON(filepath.Join(stage, "release.json"), r); err != nil {
 		return r, err
 	}
-	latest, latestErr := readRelease(filepath.Join(data, "latest.json"))
+	latest, latestErr := readReleaseAt(root, "latest.json")
 	if latestErr != nil && !errors.Is(latestErr, os.ErrNotExist) {
 		return r, latestErr
 	}
@@ -274,8 +354,8 @@ func publish(data, base, apk, version string, code int64, expected string, publi
 		return r, errors.New("version code already belongs to another release")
 	}
 	directory := filepath.Join(data, r.Tag)
-	if existing, err := readRelease(filepath.Join(directory, "release.json")); err == nil {
-		if existing.VersionCode != code || existing.Assets[0].Digest != r.Assets[0].Digest {
+	if existing, err := readReleaseAt(root, filepath.Join(r.Tag, "release.json")); err == nil {
+		if existing.Tag != r.Tag || existing.VersionCode != code || existing.Assets[0].Digest != r.Assets[0].Digest {
 			return r, errors.New("release already exists with different content; publish a new version")
 		}
 		r = existing
@@ -310,12 +390,35 @@ var pageTemplate = template.Must(template.New("releases").Parse(`<!doctype html>
 <p><a href="https://github.com/flandyw/folio">Source code</a></p></html>`))
 
 func handler(data string) http.Handler {
+	active := make(chan struct{}, 128)
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+		select {
+		case active <- struct{}{}:
+			defer func() { <-active }()
+		default:
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "server busy", http.StatusServiceUnavailable)
+			return
+		}
 		if req.Method != http.MethodGet && req.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+			w.Header().Set("Connection", "close")
+			http.Error(w, "request body not allowed", http.StatusBadRequest)
+			return
+		}
+		// Only a single range is needed by the updater; multipart ranges amplify work.
+		ranges := req.Header.Values("Range")
+		if len(ranges) > 1 || (len(ranges) == 1 && strings.Contains(ranges[0], ",")) {
+			http.Error(w, "multiple ranges not supported", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
 		if req.URL.Path == "/healthz" {
@@ -329,10 +432,16 @@ func handler(data string) http.Handler {
 			http.Redirect(w, req, "/releases/", http.StatusFound)
 			return
 		}
-		latestPath := filepath.Join(data, "latest.json")
+		root, err := os.OpenRoot(data)
+		if err != nil {
+			http.Error(w, "releases unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		defer root.Close()
+		latestPath := "latest.json"
 		switch req.URL.Path {
 		case "/releases/latest.json":
-			r, err := readRelease(latestPath)
+			r, err := readReleaseAt(root, latestPath)
 			if errors.Is(err, os.ErrNotExist) {
 				http.NotFound(w, req)
 				return
@@ -347,9 +456,13 @@ func handler(data string) http.Handler {
 			}
 			return
 		case "/releases/latest", "/releases/latest.apk":
-			r, err := readRelease(latestPath)
+			r, err := readReleaseAt(root, latestPath)
 			if err != nil {
-				http.NotFound(w, req)
+				if errors.Is(err, os.ErrNotExist) {
+					http.NotFound(w, req)
+				} else {
+					http.Error(w, "release unavailable", http.StatusServiceUnavailable)
+				}
 				return
 			}
 			target := "/releases/" + r.Tag + "/"
@@ -360,7 +473,13 @@ func handler(data string) http.Handler {
 			return
 		}
 		if req.URL.Path == "/releases/" {
-			entries, err := os.ReadDir(data)
+			dir, err := root.Open(".")
+			if err != nil {
+				http.Error(w, "releases unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			entries, err := dir.ReadDir(-1)
+			dir.Close()
 			if err != nil {
 				http.Error(w, "releases unavailable", http.StatusServiceUnavailable)
 				return
@@ -368,7 +487,7 @@ func handler(data string) http.Handler {
 			var releases []release
 			for _, e := range entries {
 				if e.IsDir() && strings.HasPrefix(e.Name(), "v") {
-					if r, err := readRelease(filepath.Join(data, e.Name(), "release.json")); err == nil {
+					if r, err := readReleaseAt(root, filepath.Join(e.Name(), "release.json")); err == nil && r.Tag == e.Name() {
 						releases = append(releases, r)
 					}
 				}
@@ -382,7 +501,7 @@ func handler(data string) http.Handler {
 			http.NotFound(w, req)
 			return
 		}
-		r, err := readRelease(filepath.Join(data, parts[0], "release.json"))
+		r, err := readReleaseAt(root, filepath.Join(parts[0], "release.json"))
 		if err != nil || r.Tag != parts[0] {
 			http.NotFound(w, req)
 			return
@@ -408,13 +527,7 @@ func handler(data string) http.Handler {
 			http.NotFound(w, req)
 			return
 		}
-		root, err := os.OpenRoot(data) // Prevent symlinks escaping the release directory.
-		if err != nil {
-			http.NotFound(w, req)
-			return
-		}
-		defer root.Close()
-		f, err := root.Open(filepath.Join(r.Tag, selected.Name))
+		f, err := openRegular(root, filepath.Join(r.Tag, selected.Name))
 		if err != nil {
 			http.NotFound(w, req)
 			return
@@ -439,7 +552,7 @@ func handler(data string) http.Handler {
 
 func renderPage(w http.ResponseWriter, req *http.Request, releases []release) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 	if req.Method == http.MethodGet {
 		if err := pageTemplate.Execute(w, releases); err != nil {
 			log.Printf("render: %v", err)
@@ -447,12 +560,27 @@ func renderPage(w http.ResponseWriter, req *http.Request, releases []release) {
 	}
 }
 
+func validateListen(listen string) error {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("listen must use a loopback IP behind Nginx")
+	}
+	return nil
+}
+
 func serve(data, listen string) error {
+	if err := validateListen(listen); err != nil {
+		return err
+	}
 	if _, err := os.ReadDir(data); err != nil {
 		return err
 	}
-	server := &http.Server{Addr: listen, Handler: handler(data), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
-	// Downloads can take several minutes; Nginx bounds stalled downstream connections.
+	server := &http.Server{Addr: listen, Handler: handler(data), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, WriteTimeout: 10 * time.Minute, MaxHeaderBytes: 16 * 1024}
+	// Bound total download time as well as Nginx's stalled downstream timeout.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	done := make(chan struct{})

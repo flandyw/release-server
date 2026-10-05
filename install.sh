@@ -9,7 +9,7 @@ go vet ./...
 mkdir -p build
 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/folio-release-server .
 
-sudo install -d -m 0755 /var/lib/folio-releases /var/www/folio-acme /etc/nginx/sites-available /etc/nginx/sites-enabled
+sudo install -d -o root -g root -m 0755 /var/lib/folio-releases /var/www/folio-acme /etc/nginx/sites-available /etc/nginx/sites-enabled
 if ! getent passwd folio-releases >/dev/null; then
     sudo useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin folio-releases
 fi

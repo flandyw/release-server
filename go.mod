@@ -1,3 +1,3 @@
 module folio/release-server
 
-go 1.24.0
+go 1.27.1
