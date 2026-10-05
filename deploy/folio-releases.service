@@ -1,0 +1,27 @@
+[Unit]
+Description=Folio experimental APK update server
+After=network.target
+
+[Service]
+Type=simple
+User=folio-releases
+Group=folio-releases
+ExecStart=/usr/local/bin/folio-release-server serve -listen 127.0.0.1:8787 -data /var/lib/folio-releases
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

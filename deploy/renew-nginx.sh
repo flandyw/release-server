@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+nginx -t
+systemctl reload nginx
