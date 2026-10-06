@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Build/test as the invoking user; only installation/configuration needs sudo.
-# Usage: install.sh [-c release-server.conf] letsencrypt-email
+# Usage: install.sh [-c release-server.conf] letsencrypt-email|none
+# "none" registers no contact address (certbot reuses this host's existing account).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 config=""
 if [[ "${1:-}" == "-c" ]]; then config="${2:?-c needs a file}"; shift 2; fi
-email="${1:?Usage: install.sh [-c release-server.conf] letsencrypt-email}"
-if [[ "$email" != *@* ]]; then echo "An email address is required" >&2; exit 1; fi
+email="${1:?Usage: install.sh [-c release-server.conf] letsencrypt-email|none}"
+if [[ "$email" == none ]]; then contact=(--register-unsafely-without-email)
+elif [[ "$email" == *@* ]]; then contact=(--email "$email")
+else echo "An email address (or 'none') is required" >&2; exit 1; fi
 # shellcheck source=deploy/load-config.sh
 source "$here/deploy/load-config.sh"
 load_config "$config"
@@ -62,7 +65,7 @@ if [[ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
 fi
 sudo certbot certonly --webroot --webroot-path "$ACME_DIR" \
     --domain "$DOMAIN" --cert-name "$DOMAIN" \
-    --email "$email" --agree-tos --non-interactive --keep-until-expiring
+    "${contact[@]}" --agree-tos --non-interactive --keep-until-expiring
 cat "$work/http.conf" "$work/https.conf" > "$work/site.conf"
 sudo install -m 0644 "$work/site.conf" "$site"
 sudo ln -sfn "$site" "/etc/nginx/sites-enabled/$NGINX_CONF"

@@ -19,7 +19,7 @@ for publishing, Android build-tools (`apksigner`, `aapt`). DNS for the domain mu
 git submodule add https://github.com/flandyw/release-server.git release-server
 cp release-server/release-server.conf.example release-server.conf   # edit SLUG, DOMAIN, PACKAGE, NAME
 
-./release-server/install.sh your-email@example.com        # build, test, install service + Nginx + TLS
+./release-server/install.sh your-email@example.com        # (or "none") build, test, install service + Nginx + TLS
 ./release-server/pin-cert.sh path/to/trusted-signed.apk   # pin your release signing cert
 ./release-server/publish.sh app/build/outputs/apk/release/app-release.apk
 ```
