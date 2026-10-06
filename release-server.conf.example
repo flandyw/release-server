@@ -1,0 +1,29 @@
+# Copy to your app repo as release-server.conf and edit. Plain shell KEY=value.
+# Only SLUG and DOMAIN are required; everything else has a default.
+
+SLUG=myapp                      # lowercase id: APK is <slug>-<version>.apk, host names derive from it
+DOMAIN=updates.example.com      # public host; DNS must point at this VPS
+PACKAGE=com.example.myapp       # applicationId publish.sh insists on (required to publish)
+NAME="My App"                   # shown on the download page (default: SLUG)
+
+#CHANNEL=experimental           # page title: "<NAME> <CHANNEL> builds"
+#SOURCE_URL=https://github.com/you/myapp
+#STABLE_URL=https://github.com/you/myapp/releases
+#VERSION_SCHEME=any             # any = any safe versionName; folio = X.Y.Z[-exp.N] with code=count*10000+N
+#MAX_APK_MB=100
+#CLOUDFLARE=0                   # 1 = trust Cloudflare's ranges for visitor IPs (domain is orange-clouded)
+
+# Host layout (defaults shown; <service> = ${SERVICE}). Several apps can share one VPS
+# if each has its own SLUG, DOMAIN and PORT.
+#PORT=8787                      # loopback port behind Nginx
+#SERVICE=${SLUG}-releases       # systemd unit, system user, /etc dir, Nginx site, logs
+#BINARY=/usr/local/bin/${SLUG}-release-server
+#DATA_DIR=/var/lib/${SERVICE}
+#CONFIG_DIR=/etc/${SERVICE}     # holds signing-cert.sha256 and server.env
+#ACME_DIR=/var/www/${SLUG}-acme
+
+# Publishing (publish.sh)
+#DEFAULT_APK=app/build/outputs/apk/release/app-release.apk   # relative to where you run it
+#ANDROID_HOME=$HOME/android-sdk
+#BUILD_TOOLS=$ANDROID_HOME/build-tools/36.0.0                # apksigner + aapt
+#JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64

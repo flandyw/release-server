@@ -1,47 +1,76 @@
 #!/usr/bin/env bash
 # Build/test as the invoking user; only installation/configuration needs sudo.
+# Usage: install.sh [-c release-server.conf] letsencrypt-email
 set -euo pipefail
-cd "$(dirname "$0")"
-email="${1:?Usage: ./install.sh letsencrypt-email}"
+here="$(cd "$(dirname "$0")" && pwd)"
+config=""
+if [[ "${1:-}" == "-c" ]]; then config="${2:?-c needs a file}"; shift 2; fi
+email="${1:?Usage: install.sh [-c release-server.conf] letsencrypt-email}"
 if [[ "$email" != *@* ]]; then echo "An email address is required" >&2; exit 1; fi
+# shellcheck source=deploy/load-config.sh
+source "$here/deploy/load-config.sh"
+load_config "$config"
+command -v envsubst >/dev/null || { echo "envsubst is required (apt install gettext-base)" >&2; exit 1; }
+
+cd "$here"
 go test ./...
 go vet ./...
 mkdir -p build
-CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/folio-release-server .
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/release-server .
 
-sudo install -d -o root -g root -m 0755 /var/lib/folio-releases /var/www/folio-acme /etc/nginx/sites-available /etc/nginx/sites-enabled
-if ! getent passwd folio-releases >/dev/null; then
-    sudo useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin folio-releases
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+render deploy/service.in > "$work/service"
+render deploy/nginx-http.conf.in > "$work/http.conf"
+if [[ "$CLOUDFLARE" == 1 ]]; then REAL_IP_BLOCK=$(cat deploy/nginx-cloudflare.conf); else REAL_IP_BLOCK="    # Not behind Cloudflare: client addresses come straight from the socket."; fi
+render deploy/nginx-https.conf.in > "$work/https.conf"
+cat > "$work/server.env" <<ENV
+RELEASE_DATA=$DATA_DIR
+RELEASE_BASE_URL=$BASE_URL
+RELEASE_LISTEN=127.0.0.1:$PORT
+RELEASE_SLUG=$SLUG
+RELEASE_NAME=$NAME
+RELEASE_CHANNEL=$CHANNEL
+RELEASE_SOURCE_URL=$SOURCE_URL
+RELEASE_STABLE_URL=$STABLE_URL
+RELEASE_VERSION_SCHEME=$VERSION_SCHEME
+RELEASE_MAX_APK_MB=$MAX_APK_MB
+ENV
+
+sudo install -d -o root -g root -m 0755 "$DATA_DIR" "$CONFIG_DIR" "$ACME_DIR" /etc/nginx/sites-available /etc/nginx/sites-enabled
+if ! getent passwd "$SERVICE" >/dev/null; then
+    sudo useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin "$SERVICE"
 fi
-sudo install -m 0755 build/folio-release-server /usr/local/bin/folio-release-server
-sudo install -m 0644 deploy/folio-releases.service /etc/systemd/system/folio-releases.service
+sudo install -m 0755 build/release-server "$BINARY"
+sudo install -m 0644 "$work/server.env" "$ENV_FILE"
+sudo install -m 0644 "$work/service" "/etc/systemd/system/$SERVICE.service"
 sudo systemctl daemon-reload
-sudo systemctl enable folio-releases.service
-sudo systemctl restart folio-releases.service
-curl -fsS --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/healthz
+sudo systemctl enable "$SERVICE.service"
+sudo systemctl restart "$SERVICE.service"
+curl -fsS --retry 5 --retry-connrefused --retry-delay 1 "http://127.0.0.1:$PORT/healthz"
 
 # Back up only this host's config, and keep its existing TLS config during renewal.
-if [[ -e /etc/nginx/sites-available/folio-releases.conf ]]; then
-    sudo cp -a /etc/nginx/sites-available/folio-releases.conf "/etc/nginx/sites-available/folio-releases.conf.backup-$(date +%Y%m%d%H%M%S)"
+site="/etc/nginx/sites-available/$NGINX_CONF"
+if [[ -e "$site" ]]; then
+    sudo cp -a "$site" "$site.backup-$(date +%Y%m%d%H%M%S)"
 fi
-if [[ ! -f /etc/letsencrypt/live/folio.flandolf.me/fullchain.pem ]]; then
-    sudo install -m 0644 deploy/nginx-http.conf /etc/nginx/sites-available/folio-releases.conf
-    sudo ln -sfn /etc/nginx/sites-available/folio-releases.conf /etc/nginx/sites-enabled/folio-releases.conf
+if [[ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
+    sudo install -m 0644 "$work/http.conf" "$site"
+    sudo ln -sfn "$site" "/etc/nginx/sites-enabled/$NGINX_CONF"
     sudo nginx -t
     sudo systemctl reload nginx
 fi
-sudo certbot certonly --webroot --webroot-path /var/www/folio-acme \
-    --domain folio.flandolf.me --cert-name folio.flandolf.me \
+sudo certbot certonly --webroot --webroot-path "$ACME_DIR" \
+    --domain "$DOMAIN" --cert-name "$DOMAIN" \
     --email "$email" --agree-tos --non-interactive --keep-until-expiring
-config=$(mktemp)
-trap 'rm -f "$config"' EXIT
-cat deploy/nginx-http.conf deploy/nginx-https.conf > "$config"
-sudo install -m 0644 "$config" /etc/nginx/sites-available/folio-releases.conf
-sudo ln -sfn /etc/nginx/sites-available/folio-releases.conf /etc/nginx/sites-enabled/folio-releases.conf
+cat "$work/http.conf" "$work/https.conf" > "$work/site.conf"
+sudo install -m 0644 "$work/site.conf" "$site"
+sudo ln -sfn "$site" "/etc/nginx/sites-enabled/$NGINX_CONF"
 sudo nginx -t
 sudo systemctl reload nginx
 sudo install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-sudo install -m 0755 deploy/renew-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/folio-nginx
+sudo install -m 0755 deploy/renew-nginx.sh /etc/letsencrypt/renewal-hooks/deploy/release-server-nginx
 sudo systemctl enable --now certbot.timer
-curl -fsS --retry 3 --retry-delay 2 https://folio.flandolf.me/healthz
-echo "Folio experimental server installed: https://folio.flandolf.me/releases/"
+curl -fsS --retry 3 --retry-delay 2 "$BASE_URL/healthz"
+echo "$NAME $CHANNEL server installed: $BASE_URL/releases/"
+echo "Next: pin your release signing certificate with pin-cert.sh, then publish with publish.sh."

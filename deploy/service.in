@@ -1,12 +1,13 @@
 [Unit]
-Description=Folio experimental APK update server
+Description=${NAME} APK release server
 After=network.target
 
 [Service]
 Type=simple
-User=folio-releases
-Group=folio-releases
-ExecStart=/usr/local/bin/folio-release-server serve -listen 127.0.0.1:8787 -data /var/lib/folio-releases
+User=${SERVICE}
+Group=${SERVICE}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${BINARY} serve
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=35

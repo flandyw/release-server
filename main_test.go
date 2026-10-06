@@ -17,6 +17,12 @@ import (
 	"time"
 )
 
+func folioConfig(data string) config {
+	return config{Data: data, Base: "https://folio.flandolf.me", Slug: "folio", Name: "Folio", Channel: "experimental",
+		SourceURL: "https://github.com/flandyw/folio", StableURL: "https://github.com/flandyw/folio/releases",
+		Scheme: schemeFolio, MaxAPK: defaultMaxAPK}
+}
+
 func testAPK(t *testing.T, text string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.apk")
@@ -43,7 +49,7 @@ func testAPK(t *testing.T, text string) string {
 
 func addRelease(t *testing.T, data, apk, version string, code int64) release {
 	t.Helper()
-	r, err := publish(data, "https://folio.flandolf.me", apk, version, code, "", time.Now())
+	r, err := publish(folioConfig(data), apk, version, code, "", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,20 +61,20 @@ func TestPublishOrderingAndImmutability(t *testing.T) {
 	newest := addRelease(t, data, apk, "2.1.8", 218)
 	addRelease(t, data, apk, "2.1.7", 217)
 	addRelease(t, data, apk, "2.1.8", 218) // Idempotent retry.
-	latest, err := readRelease(filepath.Join(data, "latest.json"))
+	latest, err := folioConfig("").readRelease(filepath.Join(data, "latest.json"))
 	if err != nil || latest.Tag != newest.Tag {
 		t.Fatalf("latest downgraded: %+v, %v", latest, err)
 	}
-	if _, err := publish(data, "https://folio.flandolf.me", testAPK(t, "changed"), "2.1.8", 218, "", time.Now()); err == nil {
+	if _, err := publish(folioConfig(data), testAPK(t, "changed"), "2.1.8", 218, "", time.Now()); err == nil {
 		t.Fatal("overwrote an immutable release")
 	}
-	if _, err := publish(data, "https://folio.flandolf.me", apk, "../../escape", 219, "", time.Now()); err == nil {
+	if _, err := publish(folioConfig(data), apk, "../../escape", 219, "", time.Now()); err == nil {
 		t.Fatal("accepted traversal version")
 	}
-	if _, err := publish(data, "https://folio.flandolf.me", apk, "2.1.9", 219, strings.Repeat("0", 64), time.Now()); err == nil {
+	if _, err := publish(folioConfig(data), apk, "2.1.9", 219, strings.Repeat("0", 64), time.Now()); err == nil {
 		t.Fatal("accepted bad checksum")
 	}
-	latest, err = readRelease(filepath.Join(data, "latest.json"))
+	latest, err = folioConfig("").readRelease(filepath.Join(data, "latest.json"))
 	if err != nil || latest.Tag != newest.Tag {
 		t.Fatal("failed publish changed latest")
 	}
@@ -77,7 +83,7 @@ func TestPublishOrderingAndImmutability(t *testing.T) {
 func TestDownloadsAndAPI(t *testing.T) {
 	data, apk := t.TempDir(), testAPK(t, "download me")
 	r := addRelease(t, data, apk, "2.1.8", 218)
-	server := httptest.NewServer(handler(data))
+	server := httptest.NewServer(handler(folioConfig(data)))
 	defer server.Close()
 	resp, err := http.Get(server.URL + "/releases/latest.json")
 	if err != nil {
@@ -167,13 +173,13 @@ func TestConcurrentPublishDoesNotDowngrade(t *testing.T) {
 		wg.Add(1)
 		go func(version string, code int64) {
 			defer wg.Done()
-			if _, err := publish(data, "https://folio.flandolf.me", apk, version, code, "", time.Now()); err != nil {
+			if _, err := publish(folioConfig(data), apk, version, code, "", time.Now()); err != nil {
 				t.Error(err)
 			}
 		}(item.version, item.code)
 	}
 	wg.Wait()
-	r, err := readRelease(filepath.Join(data, "latest.json"))
+	r, err := folioConfig("").readRelease(filepath.Join(data, "latest.json"))
 	if err != nil || r.VersionCode != 219 {
 		t.Fatalf("bad concurrent latest: %+v %v", r, err)
 	}
@@ -182,7 +188,7 @@ func TestConcurrentPublishDoesNotDowngrade(t *testing.T) {
 func TestEmptyAndCorruptCatalog(t *testing.T) {
 	data := t.TempDir()
 	w := httptest.NewRecorder()
-	handler(data).ServeHTTP(w, httptest.NewRequest("GET", "/releases/latest.json", nil))
+	handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", "/releases/latest.json", nil))
 	if w.Code != 404 {
 		t.Fatal("empty server should have no update")
 	}
@@ -190,11 +196,11 @@ func TestEmptyAndCorruptCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = httptest.NewRecorder()
-	handler(data).ServeHTTP(w, httptest.NewRequest("GET", "/releases/latest.json", nil))
+	handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", "/releases/latest.json", nil))
 	if w.Code != 503 {
 		t.Fatal("corrupt catalog must not mean up to date")
 	}
-	if _, err := publish(data, "https://folio.flandolf.me", testAPK(t, "one"), "2.1.8", 218, "", time.Now()); err == nil {
+	if _, err := publish(folioConfig(data), testAPK(t, "one"), "2.1.8", 218, "", time.Now()); err == nil {
 		t.Fatal("silently replaced corrupt catalog")
 	}
 }
@@ -205,13 +211,13 @@ func TestExperimentalRevisionsAndLegacyHistory(t *testing.T) {
 	first := addRelease(t, data, apk, "2.1.7-exp.1", 2170001)
 	second := addRelease(t, data, apk, "2.1.7-exp.2", 2170002)
 	addRelease(t, data, apk, "2.1.7-exp.1", 2170001)
-	latest, err := readRelease(filepath.Join(data, "latest.json"))
+	latest, err := folioConfig("").readRelease(filepath.Join(data, "latest.json"))
 	if err != nil || latest.VersionCode != second.VersionCode {
 		t.Fatal("revision pointer downgraded")
 	}
 	for _, r := range []release{first, second} {
 		w := httptest.NewRecorder()
-		handler(data).ServeHTTP(w, httptest.NewRequest("GET", "/releases/"+r.Tag+"/"+r.Assets[0].Name, nil))
+		handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", "/releases/"+r.Tag+"/"+r.Assets[0].Name, nil))
 		if w.Code != 200 {
 			t.Fatalf("experimental APK not served: %s", r.Tag)
 		}
@@ -224,7 +230,7 @@ func TestExperimentalRevisionsAndLegacyHistory(t *testing.T) {
 		{"2.1.7-exp.3", 2170002}, {"02.1.7-exp.3", 2170003},
 		{"2100.0.0-exp.1", 2100000001}, {"2.1.7-exp.1/escape", 2170001},
 	} {
-		if _, err := publish(data, "https://folio.flandolf.me", apk, bad.version, bad.code, "", time.Now()); err == nil {
+		if _, err := publish(folioConfig(data), apk, bad.version, bad.code, "", time.Now()); err == nil {
 			t.Fatalf("accepted invalid revision: %+v", bad)
 		}
 	}
@@ -244,8 +250,8 @@ func TestRejectUntrustedManifest(t *testing.T) {
 		"header injection":   func(r *release) { r.Assets[0].Digest = "sha256:bad\r\nInjected: yes" },
 		"missing digest":     func(r *release) { r.Assets[0].Digest = "" },
 		"empty APK":          func(r *release) { r.Assets[0].Size = 0 },
-		"oversized APK":      func(r *release) { r.Assets[0].Size = maxAPK + 1 },
-		"oversized checksum": func(r *release) { r.Assets[1].Size = maxAPK },
+		"oversized APK":      func(r *release) { r.Assets[0].Size = defaultMaxAPK + 1 },
+		"oversized checksum": func(r *release) { r.Assets[1].Size = defaultMaxAPK },
 		"draft":              func(r *release) { r.Draft = true },
 	}
 	for name, mutate := range mutations {
@@ -258,7 +264,7 @@ func TestRejectUntrustedManifest(t *testing.T) {
 			}
 			for _, path := range []string{"/releases/latest.json", "/releases/latest", "/releases/latest.apk"} {
 				w := httptest.NewRecorder()
-				handler(data).ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+				handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", path, nil))
 				if w.Code != 503 {
 					t.Fatalf("%s: status %d", path, w.Code)
 				}
@@ -278,7 +284,7 @@ func TestRejectUntrustedManifest(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(data, "latest.json"), body, 0644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := readRelease(filepath.Join(data, "latest.json")); err == nil {
+			if _, err := folioConfig("").readRelease(filepath.Join(data, "latest.json")); err == nil {
 				t.Fatal("accepted corrupt manifest")
 			}
 		})
@@ -323,13 +329,13 @@ func TestConfinedReleaseReads(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := httptest.NewRecorder()
-			handler(data).ServeHTTP(w, httptest.NewRequest("GET", request, nil))
+			handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", request, nil))
 			if w.Code != 404 && w.Code != 503 {
 				t.Fatalf("unsafe file served: status %d", w.Code)
 			}
 			if target == "manifest" || target == "directory" {
 				w = httptest.NewRecorder()
-				handler(data).ServeHTTP(w, httptest.NewRequest("GET", "/releases/", nil))
+				handler(folioConfig(data)).ServeHTTP(w, httptest.NewRequest("GET", "/releases/", nil))
 				if strings.Contains(w.Body.String(), r.Assets[0].Name) {
 					t.Fatal("unsafe manifest included in catalog")
 				}
@@ -341,7 +347,7 @@ func TestConfinedReleaseReads(t *testing.T) {
 func TestRequestLimitsAndSecurityHeaders(t *testing.T) {
 	data := t.TempDir()
 	r := addRelease(t, data, testAPK(t, "ranges"), "2.1.8", 218)
-	h := handler(data)
+	h := handler(folioConfig(data))
 	path := "/releases/" + r.Tag + "/" + r.Assets[0].Name
 	for _, ranges := range [][]string{{"bytes=0-1,2-3"}, {"bytes=0-1", "bytes=2-3"}} {
 		req := httptest.NewRequest("GET", path, nil)
@@ -385,7 +391,7 @@ func TestLoopbackOnly(t *testing.T) {
 		}
 	}
 	for _, addr := range []string{":8787", "0.0.0.0:8787", "[::]:8787", "192.0.2.1:8787", "localhost:8787", "invalid"} {
-		if err := serve(t.TempDir(), addr); err == nil {
+		if err := serve(folioConfig(t.TempDir()), addr); err == nil {
 			t.Fatalf("accepted public/ambiguous listener %s", addr)
 		}
 	}
@@ -398,13 +404,13 @@ func TestPublishVerifiedChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(bytes)
-	if err := run([]string{"publish", "-data", data, "-apk", apk, "-version-name", "2.1.8", "-version-code", "218", "-expected-sha256", hex.EncodeToString(digest[:])}); err != nil {
+	if err := run([]string{"publish", "-data", data, "-base-url", "https://folio.flandolf.me", "-slug", "folio", "-version-scheme", "folio", "-apk", apk, "-version-name", "2.1.8", "-version-code", "218", "-expected-sha256", hex.EncodeToString(digest[:])}); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{"publish", "-data", data, "-apk", testAPK(t, "replaced"), "-version-name", "2.1.9", "-version-code", "219", "-expected-sha256", hex.EncodeToString(digest[:])}); err == nil {
+	if err := run([]string{"publish", "-data", data, "-base-url", "https://folio.flandolf.me", "-slug", "folio", "-version-scheme", "folio", "-apk", testAPK(t, "replaced"), "-version-name", "2.1.9", "-version-code", "219", "-expected-sha256", hex.EncodeToString(digest[:])}); err == nil {
 		t.Fatal("published replaced APK")
 	}
-	latest, err := readRelease(filepath.Join(data, "latest.json"))
+	latest, err := folioConfig("").readRelease(filepath.Join(data, "latest.json"))
 	if err != nil || latest.VersionCode != 218 {
 		t.Fatal("failed checksum changed latest")
 	}
@@ -425,9 +431,64 @@ func TestPublishRejectsUnsafeLock(t *testing.T) {
 			} else if err := syscall.Mkfifo(path, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := publish(data, publicOrigin, testAPK(t, "locked"), "2.1.8", 218, "", time.Now()); err == nil {
+			if _, err := publish(folioConfig(data), testAPK(t, "locked"), "2.1.8", 218, "", time.Now()); err == nil {
 				t.Fatal("accepted unsafe publish lock")
 			}
 		})
+	}
+}
+
+func TestOtherAppConfig(t *testing.T) {
+	data := t.TempDir()
+	cfg := config{Data: data, Base: "https://updates.example.org", Slug: "other-app", Name: "Other App", Channel: "beta", Scheme: schemeAny, MaxAPK: defaultMaxAPK}
+	apk := testAPK(t, "other")
+	r, err := publish(cfg, apk, "1.4.0-beta2", 14002, "", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Assets[0].Name != "other-app-1.4.0-beta2.apk" || r.URL != "https://updates.example.org/releases/v1.4.0-beta2/" || r.Name != "Other App 1.4.0-beta2" {
+		t.Fatalf("unexpected release %+v", r)
+	}
+	// A release from a differently configured channel is not trusted.
+	if _, err := folioConfig(data).readRelease(filepath.Join(data, "latest.json")); err == nil {
+		t.Fatal("read another app's manifest")
+	}
+	for _, bad := range []string{"../x", ".hidden", "a/b", "", "a b"} {
+		if _, err := publish(cfg, apk, bad, 15000, "", time.Now()); err == nil {
+			t.Fatalf("accepted version %q", bad)
+		}
+	}
+	w := httptest.NewRecorder()
+	handler(cfg).ServeHTTP(w, httptest.NewRequest("GET", "/releases/", nil))
+	body := w.Body.String()
+	if w.Code != 200 || !strings.Contains(body, "Other App beta builds") || strings.Contains(body, "Source code") {
+		t.Fatalf("page: %d %s", w.Code, body)
+	}
+	w = httptest.NewRecorder()
+	handler(cfg).ServeHTTP(w, httptest.NewRequest("GET", "/releases/"+r.Tag+"/"+r.Assets[0].Name, nil))
+	if w.Code != 200 {
+		t.Fatalf("download: %d", w.Code)
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	good := config{Data: "/tmp/x", Base: "https://updates.example.org", Slug: "app", Name: "App", Channel: "beta", Scheme: schemeAny, MaxAPK: defaultMaxAPK}
+	if err := good.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*config){
+		"http":           func(c *config) { c.Base = "http://updates.example.org" },
+		"path":           func(c *config) { c.Base = "https://updates.example.org/x" },
+		"trailing slash": func(c *config) { c.Base = "https://updates.example.org/" },
+		"slug":           func(c *config) { c.Slug = "../app" },
+		"scheme":         func(c *config) { c.Scheme = "weird" },
+		"link":           func(c *config) { c.SourceURL = "javascript:alert(1)" },
+		"size":           func(c *config) { c.MaxAPK = 0 },
+	} {
+		c := good
+		mutate(&c)
+		if c.validate() == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

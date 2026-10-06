@@ -1,0 +1,51 @@
+# Included from Nginx's http context. These zones apply only to this server.
+limit_req_zone $binary_remote_addr zone=${SLUG}_requests:1m rate=20r/s;
+limit_conn_zone $server_name zone=${SLUG}_connections:1m;
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${DOMAIN};
+
+${REAL_IP_BLOCK}
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    access_log /var/log/nginx/${SERVICE}.access.log;
+    error_log /var/log/nginx/${SERVICE}.error.log;
+    server_tokens off;
+    client_max_body_size 1k;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 30s;
+    keepalive_requests 100;
+    limit_req zone=${SLUG}_requests burst=40 nodelay;
+    limit_req_status 429;
+    limit_conn ${SLUG}_connections 128;
+    limit_conn_status 503;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        if ($http_content_length !~ "^(|0)$") { return 400; }
+        if ($http_transfer_encoding != "") { return 400; }
+        # The updater needs single ranges only; enforce this in Go as well.
+        if ($http_range ~ ",") { return 416; }
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host ${DOMAIN};
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        send_timeout 60s;
+        # Stream APKs without filling Nginx's temporary-file directory.
+        proxy_buffering off;
+    }
+}
