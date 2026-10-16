@@ -92,6 +92,9 @@ func (c config) validate() error {
 	return nil
 }
 
+// keepBuilds is how many of the most recent builds stay published.
+const keepBuilds = 15
+
 func (c config) apkName(version string) string { return c.Slug + "-" + version + ".apk" }
 
 func (c config) validVersion(version string, code int64) bool {
@@ -465,7 +468,50 @@ func publish(c config, apk, version string, code int64, expected string, publish
 		}
 	}
 	log.Printf("published %s (version code %d, SHA-256 %s)", r.Tag, code, digest)
+	if err = prune(c, root); err != nil {
+		log.Printf("pruning old builds: %v", err)
+	}
 	return r, nil
+}
+
+// prune deletes all but the keepBuilds highest-versionCode builds. It runs under
+// the publish lock. Only directories holding a valid release.json are touched, and
+// the build latest.json points at is never removed.
+func prune(c config, root *os.Root) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return err
+	}
+	var builds []release
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "v") {
+			if r, err := c.readReleaseAt(root, filepath.Join(e.Name(), "release.json")); err == nil && r.Tag == e.Name() {
+				builds = append(builds, r)
+			}
+		}
+	}
+	if len(builds) <= keepBuilds {
+		return nil
+	}
+	sort.Slice(builds, func(i, j int) bool { return builds[i].VersionCode > builds[j].VersionCode })
+	latest, _ := c.readReleaseAt(root, "latest.json")
+	var errs []error
+	for _, r := range builds[keepBuilds:] {
+		if r.Tag == latest.Tag {
+			continue
+		}
+		if err := root.RemoveAll(r.Tag); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		log.Printf("pruned %s", r.Tag)
+	}
+	return errors.Join(errs...)
 }
 
 var pageTemplate = template.Must(template.New("releases").Parse(`<!doctype html>

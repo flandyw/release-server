@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -489,6 +490,36 @@ func TestConfigValidation(t *testing.T) {
 		mutate(&c)
 		if c.validate() == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestPruneKeepsNewestBuilds(t *testing.T) {
+	data, apk := t.TempDir(), testAPK(t, "prune")
+	for code := int64(100); code < 120; code++ {
+		addRelease(t, data, apk, "2.1."+strconv.FormatInt(code, 10), code)
+	}
+	entries, err := os.ReadDir(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dirs int
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs++
+		}
+	}
+	if dirs != keepBuilds {
+		t.Fatalf("kept %d builds, want %d", dirs, keepBuilds)
+	}
+	for code := 100; code < 105; code++ {
+		if _, err := os.Stat(filepath.Join(data, "v2.1."+strconv.Itoa(code))); !os.IsNotExist(err) {
+			t.Fatalf("old build %d not pruned: %v", code, err)
+		}
+	}
+	for code := 105; code < 120; code++ {
+		if _, err := os.Stat(filepath.Join(data, "v2.1."+strconv.Itoa(code))); err != nil {
+			t.Fatalf("recent build %d missing: %v", code, err)
 		}
 	}
 }

@@ -69,8 +69,9 @@ Releases live in `DATA_DIR/v<version>/` (APK, `SHA256SUMS`, `release.json`). A t
 directory holds the full release until an atomic rename; `latest.json` changes atomically
 afterwards. A file lock serializes publishers, publishing an older version never
 downgrades `latest`, republishing identical bytes is safe, and changing an existing
-version (or reusing a versionCode for another version) fails. Keep old directories so
-cached update URLs stay valid, and back up `DATA_DIR`. Storage must stay root-owned
+version (or reusing a versionCode for another version) fails. Each publish then prunes
+all but the 15 highest-versionCode builds (never the one `latest.json` points to), so older
+build URLs stop working. Back up `DATA_DIR`. Storage must stay root-owned
 and unwritable by the service.
 
 ## Endpoints
